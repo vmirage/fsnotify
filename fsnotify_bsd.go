@@ -41,6 +41,7 @@ type Watcher struct {
 	watches       map[string]int      // Map of watched file diescriptors (key: path)
 	fsnFlags      map[string]uint32   // Map of watched files to flags used for filter
 	paths         map[int]string      // Map of watched paths (key: watch descriptor)
+	flags         map[string]uint32   // Map of watched paths to flags
 	finfo         map[int]os.FileInfo // Map of file information (isDir, isReg; key: watch descriptor)
 	fileExists    map[string]bool     // Keep track of if we know this file exists (to stop duplicate create events)
 	Error         chan error          // Errors are sent on this channel
@@ -62,6 +63,7 @@ func NewWatcher() (*Watcher, error) {
 		watches:       make(map[string]int),
 		fsnFlags:      make(map[string]uint32),
 		paths:         make(map[int]string),
+		flags:         make(map[string]uint32),
 		finfo:         make(map[int]os.FileInfo),
 		fileExists:    make(map[string]bool),
 		internalEvent: make(chan *FileEvent),
@@ -100,8 +102,6 @@ func (w *Watcher) addWatch(path string, flags uint32) error {
 		return errors.New("kevent instance already closed")
 	}
 
-	watchEntry := &w.kbuf[0]
-	watchEntry.Fflags = flags
 	watchDir := false
 
 	watchfd, found := w.watches[path]
@@ -109,6 +109,11 @@ func (w *Watcher) addWatch(path string, flags uint32) error {
 		fi, errstat := os.Lstat(path)
 		if errstat != nil {
 			return errstat
+		}
+
+		// don't watch socket
+		if fi.Mode()&os.ModeSocket == os.ModeSocket {
+			return nil
 		}
 
 		// Follow Symlinks
@@ -137,12 +142,33 @@ func (w *Watcher) addWatch(path string, flags uint32) error {
 
 		w.watches[path] = watchfd
 		w.paths[watchfd] = path
+		w.flags[path] = flags
 
 		w.finfo[watchfd] = fi
 		if fi.IsDir() && (flags&NOTE_WRITE) == NOTE_WRITE {
 			watchDir = true
 		}
+	} else {
+		// If we watch the file/directory with a different set of flags, merge them.
+		// This can happen when we are trying to watch a directory recursively. E.g.
+		// when the parent directory watches it's content where the subdirectory is
+		// watched for NOTE_DELETE event, and we also watch the subdirectory for
+		// NOTE_ALLEVENTS to watch the subdirectory's content. Events might happen
+		// in no particular order, so merging the flags is the best solution
+		oldflags, _ := w.flags[path]
+		if oldflags != flags {
+			flags = oldflags | flags
+			// watch the directory if the previous flags did not watch the directory
+			if w.finfo[watchfd].IsDir() &&
+				(oldflags&NOTE_WRITE) != NOTE_WRITE &&
+				(flags&NOTE_WRITE) == NOTE_WRITE {
+				watchDir = true
+			}
+		}
 	}
+	watchEntry := &w.kbuf[0]
+	watchEntry.Fflags = flags
+
 	syscall.SetKevent(watchEntry, watchfd, syscall.EVFILT_VNODE, syscall.EV_ADD|syscall.EV_CLEAR)
 
 	wd, errno := syscall.Kevent(w.kq, w.kbuf[:], nil, nil)
@@ -243,8 +269,18 @@ func (w *Watcher) readEvents() {
 			fileEvent.Name = w.paths[int(watchEvent.Ident)]
 
 			fileInfo := w.finfo[int(watchEvent.Ident)]
-			if fileInfo.IsDir() && fileEvent.IsModify() {
-				w.sendDirectoryChangeEvents(fileEvent.Name)
+			if fileInfo.IsDir() && !fileEvent.IsDelete() {
+				// make sure it is not deleted
+				_, errstat := os.Lstat(fileEvent.Name)
+				if errstat != nil {
+					if err, ok := errstat.(*os.PathError); ok && err.Err == syscall.ENOENT {
+						fileEvent.mask |= NOTE_DELETE
+					}
+				}
+			}
+
+			if fileInfo.IsDir() && fileEvent.IsModify() && !fileEvent.IsDelete() {
+				w.sendDirectoryChangeEvents(fileEvent.Name, fileEvent.mask)
 			} else {
 				// Send the event on the events channel
 				w.internalEvent <- fileEvent
@@ -299,11 +335,21 @@ func (w *Watcher) watchDirectoryFiles(dirPath string) error {
 // and sends them over the event channel. This functionality is to have
 // the BSD version of fsnotify mach linux fsnotify which provides a
 // create event for files created in a watched directory.
-func (w *Watcher) sendDirectoryChangeEvents(dirPath string) {
-	// Get all files
+func (w *Watcher) sendDirectoryChangeEvents(dirPath string, mask uint32) {
+	//Get all files
 	files, err := ioutil.ReadDir(dirPath)
 	if err != nil {
-		w.Error <- err
+		ignore := false
+		if err2, ok := err.(*os.PathError); ok && err2.Err == syscall.ENOENT {
+			// ignore the error if not found. This can particularly happen when we do
+			// a rm -fr on a subdirectory we watch recursively. It seems like there is
+			// a race condition where we get a modification event first but the folder
+			// had already been deleted and we subsequently get a delete event
+			ignore = true
+		}
+		if !ignore {
+			w.Error <- err
+		}
 	}
 
 	// Search for new files
